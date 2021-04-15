@@ -1,0 +1,1177 @@
+# SageMaker Pipelines
+
+Amazon SageMaker Pipelines support the following:
+
+* **Pipelines** - A Directed Acyclic Graph of steps and conditions to orchestrate SageMaker jobs and resource creation.
+* **Processing Job Steps** - A simplified, managed experience on SageMaker to run data processing workloads, such as feature engineering, data validation, model evaluation, and model interpretation.
+* **Training Job Steps** - An iterative process that teaches a model to make predictions by presenting examples from a training dataset.
+* **Conditional Steps** - Provides conditional execution of branches in a pipeline.
+* **Registering Models** - Creates a model package resource in the Model Registry that can be used to create deployable models in Amazon SageMaker.
+* **Parameterized Executions** - Allows pipeline executions to vary by supplied parameters.
+* **Transform Job Steps** - A batch transform to preprocess datasets to remove noise or bias that interferes with training or inference from your dataset, get inferences from large datasets, and run inference when you don't need a persistent endpoint.
+
+# SageMaker Studio Extensions
+
+SageMaker Studio provides a rich set of features to visually inspect SageMaker resources including experiments, training jobs, and pipelines.
+
+![](img/sm_studio_extensions_pipelines.png)
+
+# Our BERT Pipeline
+
+In the Processing Step, we perform Feature Engineering to create BERT embeddings from the `review_body` text using the pre-trained BERT model, and split the dataset into train, validation and test files. To optimize for Tensorflow training, we saved the files in TFRecord format. 
+
+In the Training Step, we fine-tune the BERT model to our Customer Reviews Dataset and add a new classification layer to predict the `star_rating` for a given `review_body`.
+
+In the Evaluation Step, we take the trained model and a test dataset as input, and produce a JSON file containing classification evaluation metrics.
+
+In the Condition Step, we decide whether to register this model if the accuracy of the model, as determined by our evaluation step exceeded some value. 
+
+
+![](img/bert_sagemaker_pipeline.png)
+
+The pipeline that we create follows a typical Machine Learning Application pattern of pre-processing, training, evaluation, and model registration:
+
+![A typical ML Application pipeline](img/pipeline-full.png)
+
+
+from botocore.exceptions import ClientError
+
+import os
+import sagemaker
+import logging
+import boto3
+import sagemaker
+import pandas as pd
+
+sess = sagemaker.Session()
+bucket = sess.default_bucket()
+role = sagemaker.get_execution_role()
+region = boto3.Session().region_name
+
+sm = boto3.Session().client(service_name="sagemaker", region_name=region)
+s3 = boto3.Session().client(service_name="s3", region_name=region)
+featurestore_runtime = boto3.Session().client(service_name="sagemaker-featurestore-runtime", region_name=region)
+
+
+# Set S3 Source Location (Public S3 Bucket)
+s3_public_path_tsv = "s3://amazon-reviews-pds/tsv"
+%store s3_public_path_tsv
+
+
+# Set S3 Destination Location (Our Private S3 Bucket)
+s3_private_path_tsv = "s3://{}/amazon-reviews-pds/tsv".format(bucket)
+print(s3_private_path_tsv)
+%store s3_private_path_tsv
+
+# Copy Data From the Public S3 Bucket to our Private S3 Bucket in this Account
+As the full dataset is pretty large, let's just copy 3 files into our bucket to speed things up later. 
+!aws s3 cp --recursive $s3_public_path_tsv/ $s3_private_path_tsv/ --exclude "*" --include "amazon_reviews_us_Digital_Software_v1_00.tsv.gz"
+!aws s3 cp --recursive $s3_public_path_tsv/ $s3_private_path_tsv/ --exclude "*" --include "amazon_reviews_us_Digital_Video_Games_v1_00.tsv.gz"
+!aws s3 cp --recursive $s3_public_path_tsv/ $s3_private_path_tsv/ --exclude "*" --include "amazon_reviews_us_Gift_Card_v1_00.tsv.gz"
+
+
+
+# Track the Pipeline as an `Experiment`
+import time
+
+%store -r pipeline_name
+
+try:
+    print("Using existing pipeline: {}".format(pipeline_name))
+except NameError:
+    timestamp = int(time.time())
+    pipeline_name = "BERT-pipeline-{}".format(timestamp)
+    print("Created Pipeline Name: " + pipeline_name)
+    
+# timestamp = int(time.time())
+# pipeline_name = "BERT-pipeline-{}".format(timestamp)
+# print("Created Pipeline Name: " + pipeline_name)
+
+
+running_executions = 0
+completed_executions = 0
+
+try:
+    existing_pipeline_executions_response = sm.list_pipeline_executions(
+        PipelineName=pipeline_name,
+        SortOrder="Descending",
+    )
+
+    if "PipelineExecutionSummaries" in existing_pipeline_executions_response.keys():
+        if len(existing_pipeline_executions_response["PipelineExecutionSummaries"]) > 0:
+            execution = existing_pipeline_executions_response["PipelineExecutionSummaries"][0]
+            if "PipelineExecutionStatus" in execution:
+                if execution["PipelineExecutionStatus"] == "Executing":
+                    running_executions = running_executions + 1
+                else:
+                    completed_executions = completed_executions + 1
+
+            print(
+                "[INFO] You have {} Pipeline execution(s) currently running and {} execution(s) completed.".format(
+                    running_executions, completed_executions
+                )
+            )
+    else:
+        print("[OK] Please continue.")
+except:
+    pass
+
+if running_executions == 0:
+    timestamp = int(time.time())
+    pipeline_name = "BERT-pipeline-{}".format(timestamp)
+    print("Created Pipeline Name: " + pipeline_name)
+    
+    print(pipeline_name)
+    %store pipeline_name
+    
+    
+    %store -r pipeline_experiment_name
+
+from smexperiments.experiment import Experiment
+
+try:
+    pipeline_experiment_name
+except NameError:
+    pipeline_experiment = Experiment.create(
+        experiment_name=pipeline_name,
+        description="Amazon Customer Reviews BERT Pipeline Experiment",
+        sagemaker_boto_client=sm,
+    )
+    pipeline_experiment_name = pipeline_experiment.experiment_name
+    print("Created Pipeline Experiment Name: {}".format(pipeline_experiment_name))
+    
+    print(pipeline_experiment_name)
+    %store pipeline_experiment_name
+    
+    
+    # Create the `Trial`
+    from smexperiments.trial import Trial
+    %store -r pipeline_trial_name
+
+try:
+    pipeline_trial_name
+except NameError:
+    timestamp = int(time.time())
+    pipeline_trial = Trial.create(
+        trial_name="trial-{}".format(timestamp), experiment_name=pipeline_experiment_name, sagemaker_boto_client=sm
+    )
+    pipeline_trial_name = pipeline_trial.trial_name
+    print("Created Trial Name: {}".format(pipeline_trial_name))
+    
+    
+    print(pipeline_trial_name)
+    %store pipeline_trial_name
+    
+    
+    # Define Parameters to Parametrize Pipeline Execution
+
+We define Workflow Parameters by which we can parametrize our Pipeline and vary the values injected and used in Pipeline executions and schedules without having to modify the Pipeline definition.
+
+The supported parameter types include:
+
+* `ParameterString` - representing a `str` Python type
+* `ParameterInteger` - representing an `int` Python type
+* `ParameterFloat` - representing a `float` Python type
+
+These parameters support providing a default value, which can be overridden on pipeline execution. The default value specified should be an instance of the type of the parameter.
+
+
+from sagemaker.workflow.parameters import (
+    ParameterInteger,
+    ParameterString,
+    ParameterFloat,
+)
+
+
+# Feature Engineering Step
+![Define a Processing Step for Feature Engineering](img/pipeline-2.png)
+![](img/prepare_dataset_bert.png)
+
+raw_input_data_s3_uri = "s3://{}/amazon-reviews-pds/tsv/".format(bucket)
+print(raw_input_data_s3_uri)
+
+!aws s3 ls $raw_input_data_s3_uri
+
+import time
+
+timestamp = int(time.time())
+
+input_data = ParameterString(
+    name="InputData",
+    default_value=raw_input_data_s3_uri,
+)
+
+processing_instance_count = ParameterInteger(
+    name="ProcessingInstanceCount",
+    default_value=1,
+)
+
+processing_instance_type = ParameterString(
+    name="ProcessingInstanceType",
+    default_value="ml.c5.2xlarge",
+)
+
+max_seq_length = ParameterInteger(
+    name="MaxSeqLength",
+    default_value=64,
+)
+
+balance_dataset = ParameterString(
+    name="BalanceDataset",
+    default_value="True",
+)
+
+train_split_percentage = ParameterFloat(
+    name="TrainSplitPercentage",
+    default_value=0.90,
+)
+
+validation_split_percentage = ParameterFloat(
+    name="ValidationSplitPercentage",
+    default_value=0.05,
+)
+
+test_split_percentage = ParameterFloat(
+    name="TestSplitPercentage",
+    default_value=0.05,
+)
+
+feature_store_offline_prefix = ParameterString(
+    name="FeatureStoreOfflinePrefix",
+    default_value="reviews-feature-store-" + str(timestamp),
+)
+
+feature_group_name = ParameterString(
+    name="FeatureGroupName",
+    default_value="reviews-feature-group-" + str(timestamp),
+)
+
+We create an instance of an `SKLearnProcessor` processor and we use that in our `ProcessingStep`.
+
+from sagemaker.sklearn.processing import SKLearnProcessor
+
+processor = SKLearnProcessor(
+    framework_version="0.23-1",
+    role=role,
+    instance_type=processing_instance_type,
+    instance_count=processing_instance_count,
+    env={"AWS_DEFAULT_REGION": region},
+)
+
+Finally, we use the processor instance to construct a `ProcessingStep`, along with the input and output channels and the code that will be executed when the pipeline invokes pipeline execution. This is very similar to a processor instance's `run` method, for those familiar with the existing Python SDK.
+
+Note the `input_data` parameters passed into `ProcessingStep` as the input data of the step itself. This input data will be used by the processor instance when it is run.
+
+Also, take note the `"bert-train"`, `"bert-validation"` and `"bert-test"` named channels specified in the output configuration for the processing job. Such step `Properties` can be used in subsequent steps and will resolve to their runtime values at execution. In particular, we'll call out this usage when we define our training step.
+
+
+from sagemaker.processing import ProcessingInput, ProcessingOutput
+from sagemaker.workflow.steps import ProcessingStep
+
+processing_inputs = [
+    ProcessingInput(
+        input_name="raw-input-data",
+        source=input_data,
+        destination="/opt/ml/processing/input/data/",
+        s3_data_distribution_type="ShardedByS3Key",
+    )
+]
+
+processing_outputs = [
+    ProcessingOutput(
+        output_name="bert-train",
+        s3_upload_mode="EndOfJob",
+        source="/opt/ml/processing/output/bert/train",
+    ),
+    ProcessingOutput(
+        output_name="bert-validation",
+        s3_upload_mode="EndOfJob",
+        source="/opt/ml/processing/output/bert/validation",
+    ),
+    ProcessingOutput(
+        output_name="bert-test",
+        s3_upload_mode="EndOfJob",
+        source="/opt/ml/processing/output/bert/test",
+    ),
+]
+
+processing_step = ProcessingStep(
+    name="Processing",
+    code="preprocess-scikit-text-to-bert-feature-store.py",
+    processor=processor,
+    inputs=processing_inputs,
+    outputs=processing_outputs,
+    job_arguments=[
+        "--train-split-percentage",
+        str(train_split_percentage.default_value),
+        "--validation-split-percentage",
+        str(validation_split_percentage.default_value),
+        "--test-split-percentage",
+        str(test_split_percentage.default_value),
+        "--max-seq-length",
+        str(max_seq_length.default_value),
+        "--balance-dataset",
+        str(balance_dataset.default_value),
+        "--feature-store-offline-prefix",
+        str(feature_store_offline_prefix.default_value),
+        "--feature-group-name",
+        str(feature_group_name.default_value),
+    ],
+)
+
+print(processing_step)
+
+# Train Step
+![Define a Training Step to Train a Model](img/pipeline-3.png)
+train_instance_type = ParameterString(name="TrainInstanceType", default_value="ml.c5.9xlarge")
+
+train_instance_count = ParameterInteger(name="TrainInstanceCount", default_value=1)
+
+# Setup Training Hyper-Parameters
+Note that `max_seq_length` is re-used from the processing hyper-parameters above
+
+epochs = ParameterInteger(name="Epochs", default_value=1)
+
+learning_rate = ParameterFloat(name="LearningRate", default_value=0.00001)
+
+epsilon = ParameterFloat(name="Epsilon", default_value=0.00000001)
+
+train_batch_size = ParameterInteger(name="TrainBatchSize", default_value=128)
+
+validation_batch_size = ParameterInteger(name="ValidationBatchSize", default_value=128)
+
+test_batch_size = ParameterInteger(name="TestBatchSize", default_value=128)
+
+train_steps_per_epoch = ParameterInteger(name="TrainStepsPerEpoch", default_value=50)
+
+validation_steps = ParameterInteger(name="ValidationSteps", default_value=50)
+
+test_steps = ParameterInteger(name="TestSteps", default_value=50)
+
+train_volume_size = ParameterInteger(name="TrainVolumeSize", default_value=256)
+
+use_xla = ParameterString(
+    name="UseXLA",
+    default_value="True",
+)
+
+use_amp = ParameterString(
+    name="UseAMP",
+    default_value="True",
+)
+
+freeze_bert_layer = ParameterString(
+    name="FreezeBERTLayer",
+    default_value="False",
+)
+
+enable_sagemaker_debugger = ParameterString(
+    name="EnableSageMakerDebugger",
+    default_value="False",
+)
+
+enable_checkpointing = ParameterString(
+    name="EnableCheckpointing",
+    default_value="False",
+)
+
+enable_tensorboard = ParameterString(
+    name="EnableTensorboard",
+    default_value="False",
+)
+
+input_mode = ParameterString(
+    name="InputMode",
+    default_value="File",
+)
+
+run_validation = ParameterString(
+    name="RunValidation",
+    default_value="True",
+)
+
+run_test = ParameterString(
+    name="RunTest",
+    default_value="False",
+)
+
+run_sample_predictions = ParameterString(
+    name="RunSamplePredictions",
+    default_value="False",
+)
+
+### Setup Metrics To Track Model Performance
+
+These sample log lines...
+```
+[step: 100] val_loss: 0.55 - val_accuracy: 74.64%
+```
+
+...will produce the following metrics in CloudWatch:
+
+`validation:loss` =  0.55
+
+`validation:accuracy` = 74.64
+
+<img src="img/cloudwatch_validation_metrics.png" align="left">
+
+metrics_definitions = [
+    {"Name": "train:loss", "Regex": "loss: ([0-9\\.]+)"},
+    {"Name": "train:accuracy", "Regex": "accuracy: ([0-9\\.]+)"},
+    {"Name": "validation:loss", "Regex": "val_loss: ([0-9\\.]+)"},
+    {"Name": "validation:accuracy", "Regex": "val_accuracy: ([0-9\\.]+)"},
+]
+
+### Setup Debugger and Profiler
+Define Debugger Rules as described here:  https://docs.aws.amazon.com/sagemaker/latest/dg/debugger-built-in-rules.html
+
+from sagemaker.debugger import Rule, ProfilerRule, rule_configs
+from sagemaker.debugger import DebuggerHookConfig
+from sagemaker.debugger import ProfilerConfig, FrameworkProfile
+
+debugger_hook_config = DebuggerHookConfig(
+    s3_output_path="s3://{}".format(bucket),
+)
+
+profiler_config = ProfilerConfig(
+    system_monitor_interval_millis=500,
+    framework_profile_params=FrameworkProfile(local_path="/opt/ml/output/profiler/", start_step=5, num_steps=10),
+)
+
+rules = [ProfilerRule.sagemaker(rule_configs.ProfilerReport())]
+
+### Create the Estimator
+
+We configure an Estimator and the input dataset. A typical training script loads data from the input channels, configures training with hyperparameters, trains a model, and saves a model to `model_dir` so that it can be hosted later.
+
+We also specify the model path where the models from training will be saved.
+
+Note the `train_instance_type` parameter passed may be also used and passed into other places in the pipeline. In this case, the `train_instance_type` is passed into the estimator.
+
+
+from sagemaker.tensorflow import TensorFlow
+
+estimator = TensorFlow(
+    entry_point="tf_bert_reviews.py",
+    source_dir="src",
+    role=role,
+    instance_count=train_instance_count,  # Make sure you have at least this number of input files or the ShardedByS3Key distibution strategy will fail the job due to no data available
+    instance_type=train_instance_type,
+    volume_size=train_volume_size,
+    py_version="py37",
+    framework_version="2.3.1",
+    hyperparameters={
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "epsilon": epsilon,
+        "train_batch_size": train_batch_size,
+        "validation_batch_size": validation_batch_size,
+        "test_batch_size": test_batch_size,
+        "train_steps_per_epoch": train_steps_per_epoch,
+        "validation_steps": validation_steps,
+        "test_steps": test_steps,
+        "use_xla": use_xla,
+        "use_amp": use_amp,
+        "max_seq_length": max_seq_length,
+        "freeze_bert_layer": freeze_bert_layer,
+        "enable_sagemaker_debugger": enable_sagemaker_debugger,
+        "enable_checkpointing": enable_checkpointing,
+        "enable_tensorboard": enable_tensorboard,
+        "run_validation": run_validation,
+        "run_test": run_test,
+        "run_sample_predictions": run_sample_predictions,
+    },
+    input_mode=input_mode,
+    metric_definitions=metrics_definitions,
+    debugger_hook_config=debugger_hook_config,
+    profiler_config=profiler_config,
+    rules=rules,
+)
+
+### Setup Pipeline Step Caching
+Cache pipeline steps for a duration of time using [ISO 8601](https://en.wikipedia.org/wiki/ISO_8601#Durations) format.  
+
+More details on SageMaker Pipeline step caching here:  https://docs.aws.amazon.com/sagemaker/latest/dg/pipelines-caching.html
+
+
+from sagemaker.workflow.steps import CacheConfig
+
+cache_config = CacheConfig(enable_caching=True, expire_after="PT1H")
+### Configure Training Step
+
+Finally, we use the estimator instance to construct a `TrainingStep` as well as the `Properties` of the prior `ProcessingStep` used as input in the `TrainingStep` inputs and the code that will be executed when the pipeline invokes pipeline execution. This is very similar to an estimator's `fit` method, for those familiar with the existing Python SDK.
+
+In particular, we pass in the `S3Uri` of the `"train"`, `"validation"` and `"test"` output channel to the `TrainingStep`. The `properties` attribute of a Workflow step match the object model of the corresponding response of a describe call. These properties can be referenced as placeholder values and are resolved, or filled in, at runtime. For example, the `ProcessingStep` `properties` attribute matches the object model of the [DescribeProcessingJob](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DescribeProcessingJob.html) response object.
+
+from sagemaker.inputs import TrainingInput
+from sagemaker.workflow.steps import TrainingStep
+
+training_step = TrainingStep(
+    name="Train",
+    estimator=estimator,
+    inputs={
+        "train": TrainingInput(
+            s3_data=processing_step.properties.ProcessingOutputConfig.Outputs["bert-train"].S3Output.S3Uri,
+            content_type="text/csv",
+        ),
+        "validation": TrainingInput(
+            s3_data=processing_step.properties.ProcessingOutputConfig.Outputs["bert-validation"].S3Output.S3Uri,
+            content_type="text/csv",
+        ),
+        "test": TrainingInput(
+            s3_data=processing_step.properties.ProcessingOutputConfig.Outputs["bert-test"].S3Output.S3Uri,
+            content_type="text/csv",
+        ),
+    },
+    cache_config=cache_config,
+)
+
+print(training_step)
+
+# Evaluation Step
+
+![Define a Model Evaluation Step to Evaluate the Trained Model](img/pipeline-4.png)
+
+First, we develop an evaluation script that will be specified in a Processing step that will perform the model evaluation.
+
+The evaluation script `evaluation.py` takes the trained model and the test dataset as input, and produces a JSON file containing classification evaluation metrics such as accuracy.
+
+After pipeline execution, we will examine the resulting `evaluation.json` for analysis.
+
+The evaluation script:
+
+* loads in the model
+* reads in the test data
+* issues a bunch of predictions against the test data
+* builds a classification report, including accuracy
+* saves the evaluation report to the evaluation directory
+
+Next, we create an instance of a `ScriptProcessor` processor and we use that in our `ProcessingStep`.
+
+Note the `processing_instance_type` parameter passed into the processor.
+
+from sagemaker.sklearn.processing import SKLearnProcessor
+
+evaluation_processor = SKLearnProcessor(
+    framework_version="0.23-1",
+    role=role,
+    instance_type=processing_instance_type,
+    instance_count=processing_instance_count,
+    env={"AWS_DEFAULT_REGION": region},
+    max_runtime_in_seconds=7200,
+)
+
+We use the processor instance to construct a `ProcessingStep`, along with the input and output channels and the code that will be executed when the pipeline invokes pipeline execution. This is very similar to a processor instance's `run` method, for those familiar with the existing Python SDK.
+
+The `TrainingStep` and `ProcessingStep` `properties` attribute matches the object model of the [DescribeTrainingJob](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DescribeTrainingJob.html) and  [DescribeProcessingJob](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DescribeProcessingJob.html) response objects, respectively.
+
+from sagemaker.workflow.properties import PropertyFile
+
+evaluation_report = PropertyFile(name="EvaluationReport", output_name="metrics", path="evaluation.json")
+
+evaluation_step = ProcessingStep(
+    name="EvaluateModel",
+    processor=evaluation_processor,
+    code="evaluate_model_metrics.py",
+    inputs=[
+        ProcessingInput(
+            source=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+            destination="/opt/ml/processing/input/model",
+        ),
+        ProcessingInput(
+            source=processing_step.properties.ProcessingInputs["raw-input-data"].S3Input.S3Uri,
+            destination="/opt/ml/processing/input/data",
+        ),
+    ],
+    outputs=[
+        ProcessingOutput(
+            output_name="metrics", s3_upload_mode="EndOfJob", source="/opt/ml/processing/output/metrics/"
+        ),
+    ],
+    job_arguments=[
+        "--max-seq-length",
+        str(max_seq_length.default_value),
+    ],
+    property_files=[evaluation_report],
+)
+
+from sagemaker.model_metrics import MetricsSource, ModelMetrics
+
+model_metrics = ModelMetrics(
+    model_statistics=MetricsSource(
+        s3_uri="{}/evaluation.json".format(
+            evaluation_step.arguments["ProcessingOutputConfig"]["Outputs"][0]["S3Output"]["S3Uri"]
+        ),
+        content_type="application/json",
+    )
+)
+
+print(model_metrics)
+
+# Register Model Step
+
+![](img/pipeline-5.png)
+
+We use the estimator instance that was used for the training step to construct an instance of `RegisterModel`. The result of executing `RegisterModel` in a pipeline is a Model Package. A Model Package is a reusable model artifacts abstraction that packages all ingredients necessary for inference. Primarily, it consists of an inference specification that defines the inference image to use along with an optional model weights location.
+
+A Model Package Group is a collection of Model Packages. You can create a Model Package Group for a specific ML business problem, and you can keep adding versions/model packages into it. Typically, we expect customers to create a ModelPackageGroup for a SageMaker Workflow Pipeline so that they can keep adding versions/model packages to the group for every Workflow Pipeline run.
+
+The construction of `RegisterModel` is very similar to an estimator instance's `register` method, for those familiar with the existing Python SDK.
+
+In particular, we pass in the `S3ModelArtifacts` from the `TrainingStep`, `step_train` properties. The `TrainingStep` `properties` attribute matches the object model of the [DescribeTrainingJob](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_DescribeTrainingJob.html) response object.
+
+Of note, we provided a specific model package group name which we will use in the Model Registry and CI/CD work later on.
+
+
+
+model_approval_status = ParameterString(name="ModelApprovalStatus", default_value="PendingManualApproval")
+
+deploy_instance_type = ParameterString(name="DeployInstanceType", default_value="ml.m5.4xlarge")
+
+deploy_instance_count = ParameterInteger(name="DeployInstanceCount", default_value=1)
+
+model_package_group_name = f"BERT-Reviews-{timestamp}"
+
+print(model_package_group_name)
+
+
+inference_image_uri = sagemaker.image_uris.retrieve(
+    framework="tensorflow",
+    region=region,
+    version="2.3.1",
+    instance_type=deploy_instance_type,
+    image_scope="inference",
+)
+print(inference_image_uri)
+
+from sagemaker.workflow.step_collections import RegisterModel
+
+register_step = RegisterModel(
+    name="RegisterModel",
+    estimator=estimator,
+    image_uri=inference_image_uri,  # we have to specify, by default it's using training image
+    model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+    content_types=["application/jsonlines"],
+    response_types=["application/jsonlines"],
+    inference_instances=[deploy_instance_type],
+    transform_instances=["ml.m5.4xlarge"],
+    model_package_group_name=model_package_group_name,
+    approval_status=model_approval_status,
+    model_metrics=model_metrics,
+)
+# Create Model for Deployment Step
+
+![](img/pipeline-5.png)
+
+from sagemaker.model import Model
+
+model_name = "bert-model-{}".format(timestamp)
+
+model = Model(
+    name=model_name,
+    image_uri=inference_image_uri,
+    model_data=training_step.properties.ModelArtifacts.S3ModelArtifacts,
+    sagemaker_session=sess,
+    role=role,
+)
+
+from sagemaker.inputs import CreateModelInput
+
+create_inputs = CreateModelInput(
+    instance_type=deploy_instance_type,
+)
+
+from sagemaker.workflow.steps import CreateModelStep
+
+create_step = CreateModelStep(
+    name="CreateModel",
+    model=model,
+    inputs=create_inputs,
+)
+
+# Conditional Deployment Step
+![](img/pipeline-6.png)
+
+Finally, we'd like to only register this model if the accuracy of the model, as determined by our evaluation step, exceeded a given threshold. A `ConditionStep` allows for pipelines to support conditional execution in the pipeline DAG based on conditions of step properties.
+
+Below, we do the following:
+* define a `ConditionGreaterThan` on the accuracy value found in the output of the evaluation step
+* use the condition in the list of conditions in a `ConditionStep`
+* pass the `RegisterModel` step collection into the `if_steps` of the `ConditionStep`
+
+from sagemaker.workflow.conditions import ConditionGreaterThanOrEqualTo
+from sagemaker.workflow.condition_step import (
+    ConditionStep,
+    JsonGet,
+)
+
+min_accuracy_value = ParameterFloat(name="MinAccuracyValue", default_value=0.01)
+
+minimum_accuracy_condition = ConditionGreaterThanOrEqualTo(
+    left=JsonGet(
+        step=evaluation_step,
+        property_file=evaluation_report,
+        json_path="metrics.accuracy.value",
+    ),
+    right=min_accuracy_value,  # accuracy
+)
+
+minimum_accuracy_condition_step = ConditionStep(
+    name="AccuracyCondition",
+    conditions=[minimum_accuracy_condition],
+    if_steps=[register_step, create_step],  # success, continue with model registration
+    else_steps=[],  # fail, end the pipeline
+)
+
+# Define a Pipeline of Parameters, Steps, and Conditions
+
+Let's tie it all up into a workflow pipeline so we can execute it, and even schedule it.
+
+A pipeline requires a `name`, `parameters`, and `steps`. Names must be unique within an `(account, region)` pair so we tack on the timestamp to the name.
+
+Note:
+
+* All the parameters used in the definitions must be present.
+* Steps passed into the pipeline need not be in the order of execution. The SageMaker Workflow service will resolve the _data dependency_ DAG as steps the execution complete.
+* Steps must be unique to either pipeline step list or a single condition step if/else list.
+
+
+# Submit the Pipeline to SageMaker for Execution 
+
+Let's submit our pipeline definition to the workflow service. The role passed in will be used by the workflow service to create all the jobs defined in the steps.
+
+# Create Pipeline
+from sagemaker.workflow.pipeline import Pipeline
+
+existing_pipelines = 0
+
+existing_pipelines_response = sm.list_pipelines(
+    PipelineNamePrefix=pipeline_name,
+    SortOrder="Descending",
+)
+
+if "PipelineSummaries" in existing_pipelines_response.keys():
+    if len(existing_pipelines_response["PipelineSummaries"]) > 0:
+        existing_pipelines = existing_pipelines + 1
+        print("[INFO] You already have created {} pipeline with name {}.".format(existing_pipelines, pipeline_name))
+    else:
+        pass
+
+if existing_pipelines == 0:  # Only create the pipeline one time
+    pipeline = Pipeline(
+        name=pipeline_name,
+        parameters=[
+            input_data,
+            processing_instance_count,
+            processing_instance_type,
+            max_seq_length,
+            balance_dataset,
+            train_split_percentage,
+            validation_split_percentage,
+            test_split_percentage,
+            feature_store_offline_prefix,
+            feature_group_name,
+            train_instance_type,
+            train_instance_count,
+            epochs,
+            learning_rate,
+            epsilon,
+            train_batch_size,
+            validation_batch_size,
+            test_batch_size,
+            train_steps_per_epoch,
+            validation_steps,
+            test_steps,
+            train_volume_size,
+            use_xla,
+            use_amp,
+            freeze_bert_layer,
+            enable_sagemaker_debugger,
+            enable_checkpointing,
+            enable_tensorboard,
+            input_mode,
+            run_validation,
+            run_test,
+            run_sample_predictions,
+            min_accuracy_value,
+            model_approval_status,
+            deploy_instance_type,
+            deploy_instance_count,
+        ],
+        steps=[processing_step, training_step, evaluation_step, minimum_accuracy_condition_step],
+        sagemaker_session=sess,
+    )
+
+    pipeline.create(role_arn=role)["PipelineArn"]
+    print("Created pipeline with name {}".format(pipeline_name))
+else:
+    print(
+        "****************************************************************************************************************"
+    )
+    print(
+        "You have already create a pipeline with the name {}. This is OK. Please continue see the output of this execution.".format(
+            pipeline_name
+        )
+    )
+    print(
+        "****************************************************************************************************************"
+    )
+    
+    # Start Pipeline
+    running_executions = 0
+completed_executions = 0
+
+if existing_pipelines > 0:
+    existing_pipeline_executions_response = sm.list_pipeline_executions(
+        PipelineName=pipeline_name,
+        SortOrder="Descending",
+    )
+
+    if "PipelineExecutionSummaries" in existing_pipeline_executions_response.keys():
+        if len(existing_pipeline_executions_response["PipelineExecutionSummaries"]) > 0:
+            execution = existing_pipeline_executions_response["PipelineExecutionSummaries"][0]
+            if "PipelineExecutionStatus" in execution:
+                if execution["PipelineExecutionStatus"] == "Executing":
+                    running_executions = running_executions + 1
+                else:
+                    completed_executions = completed_executions + 1
+
+            print(
+                "[INFO] You have {} Pipeline execution(s) currently running and {} execution(s) completed.".format(
+                    running_executions, completed_executions
+                )
+            )
+    else:
+        pass
+else:
+    pass
+
+if running_executions == 0:  # Only allow 1 pipeline execution at a time to limit the resources needed
+    execution = pipeline.start(
+        parameters=dict(
+            InputData=raw_input_data_s3_uri,
+            ProcessingInstanceCount=1,
+            ProcessingInstanceType="ml.c5.2xlarge",
+            MaxSeqLength=64,
+            BalanceDataset="True",
+            TrainSplitPercentage=0.9,
+            ValidationSplitPercentage=0.05,
+            TestSplitPercentage=0.05,
+            FeatureStoreOfflinePrefix=feature_store_offline_prefix,
+            FeatureGroupName=feature_group_name,
+            LearningRate=0.000012,
+            TrainInstanceType="ml.c5.9xlarge",
+            TrainInstanceCount=1,
+            Epochs=1,
+            Epsilon=0.00000001,
+            TrainBatchSize=128,
+            ValidationBatchSize=128,
+            TestBatchSize=128,
+            TrainStepsPerEpoch=50,
+            ValidationSteps=50,
+            TestSteps=50,
+            TrainVolumeSize=256,
+            UseXLA="True",
+            UseAMP="True",
+            FreezeBERTLayer="False",
+            EnableSageMakerDebugger="False",
+            EnableCheckpointing="False",
+            EnableTensorboard="False",
+            InputMode="File",
+            RunValidation="True",
+            RunTest="False",
+            RunSamplePredictions="False",
+            MinAccuracyValue=0.01,
+            ModelApprovalStatus="PendingManualApproval",
+            DeployInstanceType="ml.m5.4xlarge",
+            DeployInstanceCount=1,
+        )
+    )
+    running_executions = running_executions + 1
+    print("Started pipeline {}.  Ignore any warnings above.".format(pipeline_name))
+    print(execution.arn)
+else:
+    print(
+        "********************************************************************************************************************"
+    )
+    print(
+        "You have already launched {} pipeline execution(s).  This is OK.  Please continue to see the output of this execution.".format(
+            running_executions
+        )
+    )
+    print(
+        "********************************************************************************************************************"
+    )
+    
+    
+    %%time
+
+import time
+from pprint import pprint
+
+executions_response = sm.list_pipeline_executions(PipelineName=pipeline_name)["PipelineExecutionSummaries"]
+pipeline_execution_status = executions_response[0]["PipelineExecutionStatus"]
+print(pipeline_execution_status)
+
+while pipeline_execution_status == "Executing":
+    try:
+        executions_response = sm.list_pipeline_executions(PipelineName=pipeline_name)["PipelineExecutionSummaries"]
+        pipeline_execution_status = executions_response[0]["PipelineExecutionStatus"]
+    except Exception as e:
+        print("Please wait...")
+        time.sleep(30)
+
+pprint(executions_response)
+
+# List Pipeline Execution Steps and Statuses After Completion
+pipeline_execution_status = executions_response[0]["PipelineExecutionStatus"]
+pipeline_execution_arn = executions_response[0]["PipelineExecutionArn"]
+
+print("Pipeline execution status {}".format(pipeline_execution_status))
+print("Pipeline execution arn {}".format(pipeline_execution_arn))
+
+
+from pprint import pprint
+
+steps = sm.list_pipeline_execution_steps(PipelineExecutionArn=pipeline_execution_arn)
+
+pprint(steps)
+
+# List All Artifacts Generated by the Pipeline
+processing_job_name = None
+training_job_name = None
+
+import time
+from sagemaker.lineage.visualizer import LineageTableVisualizer
+
+viz = LineageTableVisualizer(sagemaker.session.Session())
+
+for execution_step in reversed(steps["PipelineExecutionSteps"]):
+    print(execution_step)
+    # We are doing this because there appears to be a bug of this LineageTableVisualizer handling the Processing Step
+    if execution_step["StepName"] == "Processing":
+        processing_job_name = execution_step["Metadata"]["ProcessingJob"]["Arn"].split("/")[-1]
+        print(processing_job_name)
+        display(viz.show(processing_job_name=processing_job_name))
+    elif execution_step["StepName"] == "Train":
+        training_job_name = execution_step["Metadata"]["TrainingJob"]["Arn"].split("/")[-1]
+        print(training_job_name)
+        display(viz.show(training_job_name=training_job_name))
+    else:
+        display(viz.show(pipeline_execution_step=execution_step))
+        time.sleep(5)
+        
+        
+ ## Add Execution Run as Trial to Experiments
+ # -aws-processing-job is the default name assigned by ProcessingJob
+processing_job_tc = "{}-aws-processing-job".format(processing_job_name)
+print(processing_job_tc)
+
+response = sm.associate_trial_component(TrialComponentName=processing_job_tc, TrialName=pipeline_trial_name)
+
+# -aws-training-job is the default name assigned by TrainingJob
+training_job_tc = "{}-aws-training-job".format(training_job_name)
+print(training_job_tc)
+
+response = sm.associate_trial_component(TrialComponentName=training_job_tc, TrialName=pipeline_trial_name)
+
+
+# Analyze SageMaker Debugger Results
+restored_estimator = sagemaker.estimator.Estimator.attach(training_job_name)
+from IPython.core.display import display, HTML
+
+display(
+    HTML(
+        '<b>Review <a target="blank" href="https://s3.console.aws.amazon.com/s3/buckets/{}?prefix={}/">S3 Debugger Output Data</a></b>'.format(
+            bucket, restored_estimator.base_job_name
+        )
+    )
+)
+
+# Download SageMaker Debugger Profiling Report
+
+profiler_report_s3_uri = "s3://{}/{}/rule-output/ProfilerReport/profiler-output".format(
+    bucket, restored_estimator.base_job_name
+)
+
+aws s3 ls $profiler_report_s3_uri/
+
+!aws s3 cp --recursive $profiler_report_s3_uri ./generated_profiler_report/
+
+from IPython.core.display import display, HTML
+
+display(
+    HTML('<b>Review <a target="blank" href="./generated_profiler_report/profiler-report.html">Profiler Report</a></b>')
+)
+
+# Review the Profiling Report in SM Studio
+
+![SageMaker Studio Extensions](img/studio_pipeline_training_debugger_assigned.png)
+
+
+# Review the Pipeline in SM Studio
+![SageMaker Studio Extensions](img/sm_studio_extensions_pipelines.png)
+
+# Release Resources
+%%html
+
+<p><b>Shutting down your kernel for this notebook to release resources.</b></p>
+<button class="sm-command-button" data-commandlinker-command="kernelmenu:shutdown" style="display:none;">Shutdown Kernel</button>
+        
+<script>
+try {
+    els = document.getElementsByClassName("sm-command-button");
+    els[0].click();
+}
+catch(err) {
+    // NoOp
+}    
+</script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+        
+        
+        
+
+
+
+
+
+
+
+
+
+
+    
+    
+    
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+
+
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
