@@ -1,0 +1,64 @@
+!python --version
+
+# SageMaker
+
+!pip install --disable-pip-version-check -q sagemaker==2.29.0
+!pip install --disable-pip-version-check -q smdebug==1.0.4
+!pip install --disable-pip-version-check -q sagemaker-experiments==0.1.28
+
+# PyTorch
+_Note:  This will take a few minutes._
+
+!conda install -q -y pytorch==1.6.0 -c pytorch
+
+
+# TensorFlow
+!pip install --disable-pip-version-check -q tensorflow==2.3.1
+
+# Hugging Face Transformers (BERT)
+!pip install --disable-pip-version-check -q transformers==3.5.1
+
+
+
+# PyAthena
+!pip install --disable-pip-version-check -q PyAthena==2.1.1
+
+
+# Redshift
+!pip install --disable-pip-version-check -q SQLAlchemy==1.3.23
+
+# Zip
+!conda install -q -y zip
+
+
+# Matplotlib
+!pip install --disable-pip-version-check -q matplotlib==3.1.3
+
+
+# Seaborn
+!pip install --disable-pip-version-check -q seaborn==0.10.0
+
+
+# Summarize
+python --version
+!pip list
+setup_dependencies_passed = True
+%store setup_dependencies_passed
+%store
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
