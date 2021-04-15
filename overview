@@ -1,0 +1,21 @@
+
+///Follow on Twitter Button
+
+%%html
+
+<a href="https://twitter.com/cfregly" class="twitter-follow-button" data-size="large" data-lang="en" data-show-count="false">Follow @brendanrdaly
+</a>
+<script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+
+/// Visit Website
+
+%%html
+
+<iframe src="https://www.dalyventures.ie" width="800px" height="600px"/>
+
+
+
+
+
+
+
